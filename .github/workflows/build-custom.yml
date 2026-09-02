@@ -1,0 +1,250 @@
+name: Build custom Gledopto WLED
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get Gledopto WLED 0.15.3 source
+        uses: actions/checkout@v4
+        with:
+          repository: GLEDOPTO/WLED
+          ref: v0.15.3-gledopto
+          path: wled
+
+      - name: Add motion sensor + moon button modification
+        working-directory: wled
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p usermods/MotionToggle
+
+          cat > usermods/MotionToggle/usermod_motion_toggle.h <<'EOF'
+          #pragma once
+
+          #include "wled.h"
+          #include "../PIR_sensor_switch/usermod_PIR_sensor_switch.h"
+
+          #ifndef MOTION_FEEDBACK_PIXELS
+          #define MOTION_FEEDBACK_PIXELS 8
+          #endif
+
+          #ifndef MOTION_FEEDBACK_MS
+          #define MOTION_FEEDBACK_MS 500
+          #endif
+
+          #ifndef MOTION_FEEDBACK_BRIGHTNESS
+          #define MOTION_FEEDBACK_BRIGHTNESS 96
+          #endif
+
+          static constexpr uint8_t MOTION_REMOTE_MOON_BUTTON = 3;
+          static constexpr uint8_t MOTION_WIZ_PACKET_LEN = 13;
+
+          class MotionToggleUsermod : public Usermod {
+          private:
+            bool feedbackActive = false;
+            bool restoreOff = false;
+            uint8_t savedBriLast = 128;
+            uint32_t feedbackUntil = 0;
+            uint32_t feedbackColor = 0;
+            uint32_t lastSequence = UINT32_MAX;
+            uint32_t lastToggleMs = 0;
+
+            bool isLinkedRemote(const uint8_t* sender) const {
+              if (sender == nullptr || strlen(linked_remote) != 12) return false;
+
+              char senderHex[13];
+              snprintf(senderHex, sizeof(senderHex), "%02x%02x%02x%02x%02x%02x",
+                       sender[0], sender[1], sender[2], sender[3], sender[4], sender[5]);
+              return strcmp(senderHex, linked_remote) == 0;
+            }
+
+            PIRsensorSwitch* pirSwitch() const {
+              return static_cast<PIRsensorSwitch*>(UsermodManager::lookup(USERMOD_ID_PIRSWITCH));
+            }
+
+            void startFeedback(bool sensorEnabled) {
+              feedbackColor = sensorEnabled
+                ? RGBW32(0, 255, 0, 0)
+                : RGBW32(255, 0, 0, 0);
+
+              restoreOff = (bri == 0);
+              savedBriLast = briLast > 0 ? briLast : 128;
+
+              if (restoreOff) {
+                bri = MOTION_FEEDBACK_BRIGHTNESS;
+                stateUpdated(CALL_MODE_BUTTON);
+              }
+
+              feedbackUntil = millis() + MOTION_FEEDBACK_MS;
+              feedbackActive = true;
+              strip.trigger();
+            }
+
+          public:
+            void setup() override {}
+
+            void loop() override {
+              if (!feedbackActive) return;
+              if ((int32_t)(millis() - feedbackUntil) < 0) return;
+
+              feedbackActive = false;
+
+              if (restoreOff) {
+                PIRsensorSwitch* pir = pirSwitch();
+                const bool presenceNow =
+                  (pir != nullptr) &&
+                  pir->PIRsensorEnabled() &&
+                  (digitalRead(PIR_SENSOR_PIN) == HIGH);
+
+                briLast = savedBriLast;
+                bri = presenceNow ? savedBriLast : 0;
+                stateUpdated(CALL_MODE_BUTTON);
+                restoreOff = false;
+              }
+
+              strip.trigger();
+            }
+
+            void handleOverlayDraw() override {
+              if (!feedbackActive) return;
+
+              uint16_t count = strip.getLengthTotal();
+              if (count > MOTION_FEEDBACK_PIXELS) count = MOTION_FEEDBACK_PIXELS;
+
+              for (uint16_t i = 0; i < count; i++) {
+                strip.setPixelColor(i, feedbackColor);
+              }
+            }
+
+          #ifndef WLED_DISABLE_ESPNOW
+            bool onEspNowMessage(uint8_t* sender, uint8_t* payload, uint8_t len) override {
+              if (payload == nullptr || len != MOTION_WIZ_PACKET_LEN) return false;
+              if (payload[0] != 0x91 && payload[0] != 0x81 && payload[0] != 0x80) return false;
+              if (payload[6] != MOTION_REMOTE_MOON_BUTTON) return false;
+              if (!isLinkedRemote(sender)) return false;
+
+              const uint32_t seq =
+                ((uint32_t)payload[1]) |
+                ((uint32_t)payload[2] << 8) |
+                ((uint32_t)payload[3] << 16) |
+                ((uint32_t)payload[4] << 24);
+
+              if (seq == lastSequence) return true;
+              lastSequence = seq;
+
+              const uint32_t now = millis();
+              if (lastToggleMs != 0 && (now - lastToggleMs) < 350) return true;
+              lastToggleMs = now;
+
+              PIRsensorSwitch* pir = pirSwitch();
+              if (pir == nullptr) return false;
+
+              const bool enable = !pir->PIRsensorEnabled();
+              pir->EnablePIRsensor(enable);
+              doSerializeConfig = true;
+
+              startFeedback(enable);
+              return true;
+            }
+          #endif
+          };
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("wled00/usermods_list.cpp")
+          s = p.read_text()
+
+          include_anchor = '''#ifdef USERMOD_PIRSWITCH
+            #include "../usermods/PIR_sensor_switch/usermod_PIR_sensor_switch.h"
+          #endif
+          '''
+          include_new = include_anchor + '''
+          #ifdef USERMOD_MOTION_TOGGLE
+            #include "../usermods/MotionToggle/usermod_motion_toggle.h"
+          #endif
+          '''
+          if "usermod_motion_toggle.h" not in s:
+              if include_anchor not in s:
+                  raise SystemExit("Could not find PIR include anchor")
+              s = s.replace(include_anchor, include_new, 1)
+
+          register_anchor = '''  #ifdef USERMOD_PIRSWITCH
+            UsermodManager::add(new PIRsensorSwitch());
+            #endif
+          '''
+          register_new = register_anchor + '''
+            #ifdef USERMOD_MOTION_TOGGLE
+            UsermodManager::add(new MotionToggleUsermod());
+            #endif
+          '''
+          if "new MotionToggleUsermod()" not in s:
+              if register_anchor not in s:
+                  raise SystemExit("Could not find PIR registration anchor")
+              s = s.replace(register_anchor, register_new, 1)
+
+          p.write_text(s)
+
+          p = Path("platformio_override.ini")
+          s = p.read_text()
+          marker = "[custom_flags]\nbuild_flags =\n"
+          extra = (
+              " -D USERMOD_PIRSWITCH\n"
+              " -D USERMOD_MOTION_TOGGLE\n"
+              " -D PIR_SENSOR_PIN=13\n"
+              " -D PIR_SENSOR_OFF_SEC=0\n"
+          )
+          if "USERMOD_MOTION_TOGGLE" not in s:
+              if marker not in s:
+                  raise SystemExit("Could not find custom_flags build_flags")
+              s = s.replace(marker, marker + extra, 1)
+          p.write_text(s)
+          PY
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: wled/package-lock.json
+
+      - name: Install web UI dependencies
+        working-directory: wled
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: wled/requirements.txt
+
+      - name: Install PlatformIO
+        working-directory: wled
+        run: pip install -r requirements.txt
+
+      - name: Build GL-C-616WL firmware
+        working-directory: wled
+        run: pio run -e gledopto_eth
+
+      - name: Prepare firmware file
+        shell: bash
+        run: |
+          mkdir -p output
+          cp wled/.pio/build/gledopto_eth/firmware.bin \
+             output/GL-C-616WL_0.15.3_MotionSensor_MoonButton.bin
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: GL-C-616WL-custom-firmware
+          path: output/GL-C-616WL_0.15.3_MotionSensor_MoonButton.bin
+          if-no-files-found: error
