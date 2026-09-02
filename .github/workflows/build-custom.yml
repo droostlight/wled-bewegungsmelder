@@ -57,8 +57,9 @@ jobs:
           class MotionToggleUsermod : public Usermod {
           private:
             bool feedbackActive = false;
-            bool restoreOff = false;
-            uint8_t savedBriLast = 128;
+            bool wasOnBeforeFeedback = false;
+            bool sensorEnabledAfterToggle = false;
+            uint8_t savedBriBeforeFeedback = 128;
             uint32_t feedbackUntil = 0;
             uint32_t feedbackColor = 0;
             uint32_t lastSequence = UINT32_MAX;
@@ -88,12 +89,19 @@ jobs:
                 ? RGBW32(0, 255, 0, 0)
                 : RGBW32(255, 0, 0, 0);
 
-              restoreOff = (bri == 0);
-              savedBriLast = briLast > 0 ? briLast : 128;
+              sensorEnabledAfterToggle = sensorEnabled;
+              wasOnBeforeFeedback = (bri > 0);
+              savedBriBeforeFeedback = wasOnBeforeFeedback
+                ? bri
+                : (briLast > 0 ? briLast : 128);
 
-              if (restoreOff) {
+              if (!wasOnBeforeFeedback) {
+                // Make the 0.5 s status flash visible even if the picture was OFF.
+                const bool oldFade = fadeTransition;
+                fadeTransition = false;
                 bri = feedbackBrightness;
                 stateUpdated(CALL_MODE_BUTTON);
+                fadeTransition = oldFade;
               }
 
               feedbackUntil = millis() + feedbackMs;
@@ -110,17 +118,35 @@ jobs:
 
               feedbackActive = false;
 
-              if (restoreOff) {
-                PIRsensorSwitch* pir = pirSwitch();
-                const bool presenceNow =
+              PIRsensorSwitch* pir = pirSwitch();
+
+              // Important: when automation is ENABLED, immediately synchronise
+              // the picture with the physical LD2410C output. This fixes the
+              // case where the picture was already ON while the radar output
+              // was LOW: without this sync WLED could remain ON until the next
+              // radar edge.
+              bool targetOn = wasOnBeforeFeedback;
+              if (sensorEnabledAfterToggle) {
+                targetOn =
                   (pir != nullptr) &&
                   pir->PIRsensorEnabled() &&
                   (digitalRead(PIR_SENSOR_PIN) == HIGH);
+              }
 
-                briLast = savedBriLast;
-                bri = presenceNow ? savedBriLast : 0;
+              const uint8_t targetBri = targetOn ? savedBriBeforeFeedback : 0;
+
+              if (bri != targetBri) {
+                const bool oldFade = fadeTransition;
+                fadeTransition = true;
+                strip.setTransition(targetOn ? PIR_FADE_IN_MS : PIR_FADE_OUT_MS);
+                jsonTransitionOnce = true;
+
+                if (targetBri > 0) briLast = targetBri;
+                bri = targetBri;
                 stateUpdated(CALL_MODE_BUTTON);
-                restoreOff = false;
+                fadeTransition = oldFade;
+              } else if (targetBri > 0) {
+                briLast = targetBri;
               }
 
               strip.trigger();
@@ -337,11 +363,11 @@ jobs:
         run: |
           mkdir -p output
           cp wled/.pio/build/gledopto_eth/firmware.bin \
-             output/GL-C-616WL_0.15.3_MotionSensor_Fade_ConfigStatus.bin
+             output/GL-C-616WL_0.15.3_MotionSensor_Fade_SyncStatus_V4.bin
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: GL-C-616WL-custom-firmware-fade
-          path: output/GL-C-616WL_0.15.3_MotionSensor_Fade_ConfigStatus.bin
+          name: GL-C-616WL-custom-firmware-v4
+          path: output/GL-C-616WL_0.15.3_MotionSensor_Fade_SyncStatus_V4.bin
           if-no-files-found: error
