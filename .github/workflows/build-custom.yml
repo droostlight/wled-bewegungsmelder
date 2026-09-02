@@ -238,42 +238,54 @@ jobs:
 
           p = Path("usermods/PIR_sensor_switch/usermod_PIR_sensor_switch.h")
           s = p.read_text()
-          old_on = '''    if (bri == 0) {
-              bri = briLast;
-              stateUpdated(CALL_MODE_BUTTON);
-            }
-          '''
-          new_on = '''    if (bri == 0) {
-              const bool oldFade = fadeTransition;
-              fadeTransition = true;
-              strip.setTransition(PIR_FADE_IN_MS);
-              jsonTransitionOnce = true;
-              bri = briLast;
-              stateUpdated(CALL_MODE_BUTTON);
-              fadeTransition = oldFade;
-            }
-          '''
-          if old_on not in s: raise SystemExit("Could not patch PIR fade-in")
-          s = s.replace(old_on, new_on, 1)
-          old_off = '''    if (bri != 0) {
-              briLast = bri;
-              bri = 0;
-              stateUpdated(CALL_MODE_BUTTON);
-            }
-          '''
-          new_off = '''    if (bri != 0) {
-              const bool oldFade = fadeTransition;
-              fadeTransition = true;
-              strip.setTransition(PIR_FADE_OUT_MS);
-              jsonTransitionOnce = true;
-              briLast = bri;
-              bri = 0;
-              stateUpdated(CALL_MODE_BUTTON);
-              fadeTransition = oldFade;
-            }
-          '''
-          if old_off not in s: raise SystemExit("Could not patch PIR fade-out")
-          s = s.replace(old_off, new_off, 1)
+          import re
+
+          on_pattern = re.compile(
+              r'(?P<indent>^[ \t]*)if \(bri == 0\) \{\n'
+              r'(?P=indent)  bri = briLast;\n'
+              r'(?P=indent)  stateUpdated\(CALL_MODE_BUTTON\);\n'
+              r'(?P=indent)\}',
+              re.MULTILINE
+          )
+          on_replacement = (
+              r'\g<indent>if (bri == 0) {\n'
+              r'\g<indent>  const bool oldFade = fadeTransition;\n'
+              r'\g<indent>  fadeTransition = true;\n'
+              r'\g<indent>  strip.setTransition(PIR_FADE_IN_MS);\n'
+              r'\g<indent>  jsonTransitionOnce = true;\n'
+              r'\g<indent>  bri = briLast;\n'
+              r'\g<indent>  stateUpdated(CALL_MODE_BUTTON);\n'
+              r'\g<indent>  fadeTransition = oldFade;\n'
+              r'\g<indent>}'
+          )
+          s, n = on_pattern.subn(on_replacement, s, count=1)
+          if n != 1:
+              raise SystemExit("Could not patch PIR fade-in")
+
+          off_pattern = re.compile(
+              r'(?P<indent>^[ \t]*)if \(bri != 0\) \{\n'
+              r'(?P=indent)  briLast = bri;\n'
+              r'(?P=indent)  bri = 0;\n'
+              r'(?P=indent)  stateUpdated\(CALL_MODE_BUTTON\);\n'
+              r'(?P=indent)\}',
+              re.MULTILINE
+          )
+          off_replacement = (
+              r'\g<indent>if (bri != 0) {\n'
+              r'\g<indent>  const bool oldFade = fadeTransition;\n'
+              r'\g<indent>  fadeTransition = true;\n'
+              r'\g<indent>  strip.setTransition(PIR_FADE_OUT_MS);\n'
+              r'\g<indent>  jsonTransitionOnce = true;\n'
+              r'\g<indent>  briLast = bri;\n'
+              r'\g<indent>  bri = 0;\n'
+              r'\g<indent>  stateUpdated(CALL_MODE_BUTTON);\n'
+              r'\g<indent>  fadeTransition = oldFade;\n'
+              r'\g<indent>}'
+          )
+          s, n = off_pattern.subn(off_replacement, s, count=1)
+          if n != 1:
+              raise SystemExit("Could not patch PIR fade-out")
+
           p.write_text(s)
 
           p = Path("platformio_override.ini")
