@@ -43,6 +43,14 @@ jobs:
           #define MOTION_FEEDBACK_BRIGHTNESS 96
           #endif
 
+          #ifndef PIR_FADE_IN_MS
+          #define PIR_FADE_IN_MS 1500
+          #endif
+
+          #ifndef PIR_FADE_OUT_MS
+          #define PIR_FADE_OUT_MS 2500
+          #endif
+
           static constexpr uint8_t MOTION_REMOTE_MOON_BUTTON = 3;
           static constexpr uint8_t MOTION_WIZ_PACKET_LEN = 13;
 
@@ -55,6 +63,12 @@ jobs:
             uint32_t feedbackColor = 0;
             uint32_t lastSequence = UINT32_MAX;
             uint32_t lastToggleMs = 0;
+
+            bool feedbackWholeImage = true;
+            uint16_t feedbackStart = 0;
+            uint16_t feedbackCount = MOTION_FEEDBACK_PIXELS;
+            uint16_t feedbackMs = MOTION_FEEDBACK_MS;
+            uint8_t feedbackBrightness = MOTION_FEEDBACK_BRIGHTNESS;
 
             bool isLinkedRemote(const uint8_t* sender) const {
               if (sender == nullptr || strlen(linked_remote) != 12) return false;
@@ -78,11 +92,11 @@ jobs:
               savedBriLast = briLast > 0 ? briLast : 128;
 
               if (restoreOff) {
-                bri = MOTION_FEEDBACK_BRIGHTNESS;
+                bri = feedbackBrightness;
                 stateUpdated(CALL_MODE_BUTTON);
               }
 
-              feedbackUntil = millis() + MOTION_FEEDBACK_MS;
+              feedbackUntil = millis() + feedbackMs;
               feedbackActive = true;
               strip.trigger();
             }
@@ -115,12 +129,41 @@ jobs:
             void handleOverlayDraw() override {
               if (!feedbackActive) return;
 
-              uint16_t count = strip.getLengthTotal();
-              if (count > MOTION_FEEDBACK_PIXELS) count = MOTION_FEEDBACK_PIXELS;
+              const uint16_t total = strip.getLengthTotal();
+              if (total == 0) return;
 
-              for (uint16_t i = 0; i < count; i++) {
+              uint16_t start = feedbackWholeImage ? 0 : feedbackStart;
+              if (start >= total) start = total - 1;
+
+              uint16_t count = feedbackWholeImage ? total : feedbackCount;
+              if (count == 0) count = 1;
+              if ((uint32_t)start + count > total) count = total - start;
+
+              for (uint16_t i = start; i < (uint16_t)(start + count); i++) {
                 strip.setPixelColor(i, feedbackColor);
               }
+            }
+
+            void addToConfig(JsonObject &root) override {
+              JsonObject top = root.createNestedObject("MotionStatus");
+              top["whole-image"] = feedbackWholeImage;
+              top["start-led"] = feedbackStart;
+              top["led-count"] = feedbackCount;
+              top["duration-ms"] = feedbackMs;
+              top["brightness"] = feedbackBrightness;
+            }
+
+            bool readFromConfig(JsonObject &root) override {
+              JsonObject top = root["MotionStatus"];
+              if (top.isNull()) return false;
+              feedbackWholeImage = top["whole-image"] | feedbackWholeImage;
+              feedbackStart = top["start-led"] | feedbackStart;
+              feedbackCount = top["led-count"] | feedbackCount;
+              feedbackMs = top["duration-ms"] | feedbackMs;
+              feedbackBrightness = top["brightness"] | feedbackBrightness;
+              if (feedbackMs < 100) feedbackMs = 100;
+              if (feedbackBrightness == 0) feedbackBrightness = 1;
+              return true;
             }
 
           #ifndef WLED_DISABLE_ESPNOW
@@ -193,6 +236,46 @@ jobs:
 
           p.write_text(s)
 
+          p = Path("usermods/PIR_sensor_switch/usermod_PIR_sensor_switch.h")
+          s = p.read_text()
+          old_on = '''    if (bri == 0) {
+              bri = briLast;
+              stateUpdated(CALL_MODE_BUTTON);
+            }
+          '''
+          new_on = '''    if (bri == 0) {
+              const bool oldFade = fadeTransition;
+              fadeTransition = true;
+              strip.setTransition(PIR_FADE_IN_MS);
+              jsonTransitionOnce = true;
+              bri = briLast;
+              stateUpdated(CALL_MODE_BUTTON);
+              fadeTransition = oldFade;
+            }
+          '''
+          if old_on not in s: raise SystemExit("Could not patch PIR fade-in")
+          s = s.replace(old_on, new_on, 1)
+          old_off = '''    if (bri != 0) {
+              briLast = bri;
+              bri = 0;
+              stateUpdated(CALL_MODE_BUTTON);
+            }
+          '''
+          new_off = '''    if (bri != 0) {
+              const bool oldFade = fadeTransition;
+              fadeTransition = true;
+              strip.setTransition(PIR_FADE_OUT_MS);
+              jsonTransitionOnce = true;
+              briLast = bri;
+              bri = 0;
+              stateUpdated(CALL_MODE_BUTTON);
+              fadeTransition = oldFade;
+            }
+          '''
+          if old_off not in s: raise SystemExit("Could not patch PIR fade-out")
+          s = s.replace(old_off, new_off, 1)
+          p.write_text(s)
+
           p = Path("platformio_override.ini")
           s = p.read_text()
           marker = "[custom_flags]\nbuild_flags =\n"
@@ -201,6 +284,8 @@ jobs:
               " -D USERMOD_MOTION_TOGGLE\n"
               " -D PIR_SENSOR_PIN=13\n"
               " -D PIR_SENSOR_OFF_SEC=0\n"
+              " -D PIR_FADE_IN_MS=1500\n"
+              " -D PIR_FADE_OUT_MS=2500\n"
           )
           if "USERMOD_MOTION_TOGGLE" not in s:
               if marker not in s:
@@ -240,11 +325,11 @@ jobs:
         run: |
           mkdir -p output
           cp wled/.pio/build/gledopto_eth/firmware.bin \
-             output/GL-C-616WL_0.15.3_MotionSensor_MoonButton.bin
+             output/GL-C-616WL_0.15.3_MotionSensor_Fade_ConfigStatus.bin
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: GL-C-616WL-custom-firmware
-          path: output/GL-C-616WL_0.15.3_MotionSensor_MoonButton.bin
+          name: GL-C-616WL-custom-firmware-fade
+          path: output/GL-C-616WL_0.15.3_MotionSensor_Fade_ConfigStatus.bin
           if-no-files-found: error
